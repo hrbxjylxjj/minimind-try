@@ -42,15 +42,17 @@ def train_epoch(epoch, wandb):
             param_group['lr'] = lr
 
         with ctx:
+            # amp混合精度训练
             res = model(X)
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
             loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
+            loss += res.aux_loss # moe的辅助损失函数
             loss = loss / args.accumulation_steps
 
+        # amp混合精度训练，配合GradScaler一起使用
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:

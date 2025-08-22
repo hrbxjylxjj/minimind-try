@@ -105,7 +105,7 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     def rotate_half(x):
-        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1) # 这里选择 前半维 / 后半维分组，而不是 奇偶维分组
 
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
@@ -365,7 +365,7 @@ class MiniMindModel(nn.Module):
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)]) # 类似 GPT 的 decoder block 堆叠，每一层是 MiniMindBlock（里面应该有 Attention + MLP）。
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
@@ -420,7 +420,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.model.embed_tokens.weight = self.lm_head.weight
+        self.model.embed_tokens.weight = self.lm_head.weight # 权重共享
         self.OUT = CausalLMOutputWithPast()
 
     def forward(self,
@@ -433,12 +433,12 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         h, past_kvs, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            past_key_values=past_key_values, # 每一层的注意力都要用到之前生成过的所有 token 的 key 和 value（KV向量）。
             use_cache=use_cache,
             **args
         )
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(h[:, slice_indices, :])
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep # 如果 logits_to_keep 是整数，比如3，则 slice(-3, None) 表示只取最后3个token的位置（通常用于生成时只关心最后一步的输出）。如果 logits_to_keep 是tensor，则直接用它选取需要的部分。
+        logits = self.lm_head(h[:, slice_indices, :]) # 先对hidden states在seq_len维度做切片，然后送入lm_head，得到需要的logits。
         self.OUT.__setitem__('last_hidden_state', h)
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('aux_loss', aux_loss)
