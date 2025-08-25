@@ -219,16 +219,16 @@ class MoEGate(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.n_routed_experts = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok        # 每个 token 选择的专家数 (一般 1 或 2)
+        self.n_routed_experts = config.n_routed_experts  # 总的专家数 (例如 8、16)
 
-        self.scoring_func = config.scoring_func
-        self.alpha = config.aux_loss_alpha
-        self.seq_aux = config.seq_aux
+        self.scoring_func = config.scoring_func        # 打分方式 (目前只支持 softmax)
+        self.alpha = config.aux_loss_alpha             # auxiliary loss 系数 (负载均衡损失)
+        self.seq_aux = config.seq_aux                  # 是否在序列维度计算辅助损失
 
-        self.norm_topk_prob = config.norm_topk_prob
-        self.gating_dim = config.hidden_size
-        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        self.norm_topk_prob = config.norm_topk_prob    # 是否对 top-k 权重归一化
+        self.gating_dim = config.hidden_size           # 输入的维度 (hidden size)
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))  
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -237,15 +237,20 @@ class MoEGate(nn.Module):
 
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states, self.weight, None)
+        hidden_states = hidden_states.view(-1, h)  # 展平成 (batch_size*seq_len, hidden_size)
+        # 对每个 token 做线性映射，得到 num_experts 维的打分
+        logits = F.linear(hidden_states, self.weight, None)  # shape: (tokens, num_experts)
+
+        # softmax 归一化
         if self.scoring_func == 'softmax':
-            scores = logits.softmax(dim=-1)
+
+            scores = logits.softmax(dim=-1)  # 每个 token 在不同 expert 上的概率分布
         else:
-            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
+            raise NotImplementedError(...)
 
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
+       # 如果选了多个 expert，就要对 top-k 概率再归一化，确保它们之和为 1。
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
@@ -254,14 +259,15 @@ class MoEGate(nn.Module):
             scores_for_aux = scores
             aux_topk = self.top_k
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
-            if self.seq_aux:
+            if self.seq_aux: # 基于序列的负载均衡
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                # 这里 ce 表示每个 expert 被分配的次数分布，然后和平均概率分布做对齐，避免某些 expert 独占任务。
                 ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
                     seq_len * aux_topk / self.n_routed_experts)
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
-            else:
+            else:  #全局负载均衡，这更像是全局的信息熵正则，强制分配更均匀。
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
                 ce = mask_ce.float().mean(0)
                 Pi = scores_for_aux.mean(0)
@@ -296,6 +302,9 @@ class MOEFeedForward(nn.Module):
         x = x.view(-1, x.shape[-1])
         flat_topk_idx = topk_idx.view(-1)
         if self.training:
+            #  repeat_interleave：因为每个 token 可能被多个专家处理（比如 top-2），所以需要复制 token embedding。
+            # 遍历每个专家，把属于它的 token 子集输入进去，得到结果。
+            # 最后再按权重加权平均：
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             y = torch.empty_like(x, dtype=torch.float16)
             for i, expert in enumerate(self.experts):
@@ -312,6 +321,11 @@ class MOEFeedForward(nn.Module):
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 推理阶段使用 moe_infer 优化计算：
+        # 把 token 先按专家分组（argsort + bincount）。
+        # 每个专家只跑一遍对应的 token，避免了循环里大量布尔索引。
+        # 用 scatter_add_ 把结果写回正确位置。
+        # 这样比训练阶段更高效。
         expert_cache = torch.zeros_like(x)
         idxs = flat_expert_indices.argsort()
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
@@ -348,13 +362,24 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # Attention → Add&Norm → FFN → Add&Norm 的标准 Transformer Block。
+
+        # 残差分支保存输入
         residual = hidden_states
+
+        # ===== ① Attention 模块 =====
         hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states), position_embeddings,
+            self.input_layernorm(hidden_states),   # 先做 LayerNorm 再送入 Attention
+            position_embeddings,
             past_key_value, use_cache, attention_mask
         )
+        # 残差连接：原输入 + Attention 输出
         hidden_states += residual
+
+        # ===== ② FeedForward 模块 =====
+        # 注意，这里先做 LayerNorm 再送入 MLP
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+
         return hidden_states, present_key_value
 
 
